@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+
+set -e
+
+# Automation for (at least bits of) https://docs.google.com/document/d/1qencE-eZ9OudAvW6uZmZ4VKj3ArQ0k5FzgmOk-mZ0ck/edit#
+# But specific to aws-efs-operator via community-operators
+
+# PREREQUISITES:
+# - The bundle being tested. The CSV references.. 
+# - A built and pushed operator image.
+# - Quay repository application with:
+#   - Name aws-efs-operator-app
+#   - Write permissions for 2uasimojo+robot
+#   - No existing release for whatever you're testing.
+#     If bundle push fails with "package exists already", you have to delete
+#     and recreate the whole application.
+
+REPO_ROOT=$(git rev-parse --show-toplevel)
+HERE=${0%/*}
+OPNAME=aws-efs-operator
+BUNDLE_DIR=$REPO_ROOT/community-operators/$OPNAME
+
+err() {
+    echo "$@" >&2
+    exit -1
+}
+
+log() {
+    echo
+    echo "======== $@"
+}
+
+poll() {
+  echo "Polling: '$1'"
+  while ! eval "$1"; do
+    echo -n .
+    sleep 1
+  done
+}
+
+rename_package() {
+    sed -i "s/packageName: .*/packageName: $1/" $BUNDLE_DIR/${OPNAME}.package.yaml
+}
+
+if [[ $# -lt 1 || $1 == '-'* ]]; then
+  err "
+Usage: $0 VERSION
+
+    VERSION  The (semver) version to install, e.g. '0.0.4'.
+    PHASE    One of the following. If omitted, all phases are run.
+             NAME       EFFECT
+             setup      elevate, ensure namespace
+             deploy     push bundle application via operator-courier,
+                        create/replace opsource and opgroup,
+                        create subscription, validate deployment
+
+Example of testing an upgrade:
+    $0 0.0.2  # Runs all the things
+    # ... validate the 0.0.2 deployment ...
+    $0 0.0.3 deploy  # Skip setup and just upgrade
+    # ... validate the upgrade to 0.0.3 ...
+"
+  exit -1
+fi
+VERSION=$1
+PHASE=$2
+
+phase() {
+    [ -z "$PHASE" ] || [[ "$PHASE" == "$1" ]]
+    return $?
+}
+
+OPSRC_NAME=${OPNAME}-source
+OG_NAME=${OPNAME}-og
+CHANNEL=stable
+# Namespace into which we'll install the operator
+OPNS=test-openshift-aws-efs
+
+# Validate specified version
+CSV=$BUNDLE_DIR/$VERSION/${OPNAME}.v${VERSION}.clusterserviceversion.yaml
+[[ -f $CSV ]] || err "
+ENOENT: $CSV
+Invalid VERSION likely
+"
+
+# STEP: 1
+# Ensure operator-courier is installed
+which operator-courier >/dev/null 2>&1 || pip3 install operator-courier --user
+
+# STEP: 2-4
+# Create a quay repo for the operator, and a robot user for same.
+# SKIP. This already exists for me
+
+# STEP: 5-7
+# CLI robot access to quay repo for the operator
+# From https://quay.io/repository/2uasimojo/aws-efs-operator?tab=settings
+# NOTE: Variable names changed since common with quay application
+export QUAY_ROBOT_TOKEN='P7K9WYZ8KNFF9CPNU4A9A41H8ZEN3KR5C80MWPVBL4M829AA7B4QIRGRUUT7LTY1'
+export QUAY_ROBOT_USER='2uasimojo+robot'
+export QUAY_ORG='2uasimojo'
+
+# STEP: 8
+# Name of the operator repository
+export REPOSITORY_NAME=$OPNAME
+
+# STEP: 9-11
+# Tag, build, and push operator image
+# SKIP. Do this from
+#   repo aws-efs-operator
+#       via
+#   make USER=2uasimojo build && make USER=2uasimojo push
+
+# STEP: 12
+# Create quay repo for the application
+# SKIP. This already exists for me
+
+# STEP: 13-14
+# Create robot user for quay application
+# SKIP. Same robot user as for the operator
+
+# STEP: 15-17
+# CLI robot access to quay application
+# From https://quay.io/application/2uasimojo/aws-efs-operator-app?tab=settings
+# SKIP. Reuse common variable names from STEP: 5-7 above
+
+# STEP: 18
+# Name of the quay application
+export APPLICATION_NAME="${OPNAME}-app"
+
+if phase setup; then
+    # STEP: 21
+    # Create operator bundle
+    # SKIP. This is in $BUNDLE_DIR
+
+    # STEP: 22
+    # Log into cluster as admin
+    # Expect already logged in:
+    #   ocmlogin
+    #   ocm cluster login $clustername
+    # But make sure privs are elevated
+    # TODO: Wait for this to be effective. For now, kick it off first to take
+    # advantage of the delay from other slow but non-cluster stuff below.
+    log "Elevating cluster privileges"
+    elevate
+
+    log "Ensuring namespace $OPNS"
+    oc get namespace $OPNS >/dev/null 2>&1 || oc create namespace $OPNS
+fi
+
+if phase deploy; then
+    # STEP: 19-20
+    log "Generating access token for operator-courier"
+    APPLICATION_ROBOT_TOKEN_BASIC="$(curl -s -H "Content-Type: application/json" -XPOST https://quay.io/cnr/api/v1/users/login -d '{"user":{"username":"'"${QUAY_ROBOT_USER}"'","password": "'"${QUAY_ROBOT_TOKEN}"'"}}'|jq -r .token)"
+    
+    # STEP: 27
+    log "Pushing operator bundle for version $VERSION"
+    # HACK! Application and operator are both in my org, so can't have the same name!
+    trap "rename_package ${OPNAME}" EXIT
+    rename_package $APPLICATION_NAME
+    operator-courier --verbose push "$BUNDLE_DIR" "$QUAY_ORG" "$APPLICATION_NAME" "$VERSION" "$APPLICATION_ROBOT_TOKEN_BASIC"
+
+    log "Checking for existing operatorsource"
+    if oc get operatorsource -n openshift-marketplace $OPSRC_NAME; then
+        log "Cleaning up operatorsource"
+        oc delete operatorsource -n openshift-marketplace $OPSRC_NAME
+    fi
+
+    log "Checking for existing operatorgroup"
+    if oc get operatorgroup -n $OPNS $OG_NAME; then
+        log "Cleaning up operatorgroup"
+        oc delete operatorgroup -n $OPNS $OG_NAME
+    fi
+
+    # STEP: 23
+    log "Creating operatorsource"
+    echo "
+apiVersion: operators.coreos.com/v1
+kind: OperatorSource
+metadata:
+  name: $OPSRC_NAME
+  # namespace: test-openshift-aws-efs
+  namespace: openshift-marketplace
+  # has to be openshift-marketplace
+  # Does it? Does it really?
+  # Yes, yes it does. Why?
+spec:
+  type: appregistry
+  endpoint: https://quay.io/cnr
+  registryNamespace: $QUAY_ORG
+" | oc apply -f -
+    
+    # STEP: 24
+    log "Validating operatorsource"
+    poll "oc get operatorsource -n openshift-marketplace $OPSRC_NAME -o json | jq -r .status.currentPhase.phase.name | grep Succeeded"
+    poll "oc get pods -n openshift-marketplace | grep $OPNAME | grep Running"
+    
+    # STEP: 25
+    log "Creating operatorgroup"
+    echo "
+apiVersion: operators.coreos.com/v1alpha2
+kind: OperatorGroup
+metadata:
+  name: $OG_NAME
+  namespace: $OPNS
+# NOTE: If using install mode AllNamespaces, OMIT the .spec entirely.
+# spec:
+#   targetNamespaces:
+#   - $OPNS
+" | oc apply -f -
+
+    # STEP: 28
+    log "Creating subscription"
+    SUBSCRIPTION_NAME=${OPNAME}-subscription
+    echo "
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: $SUBSCRIPTION_NAME
+  namespace: $OPNS
+spec:
+  channel: stable
+  name: $OPNAME
+  source: $OPSRC_NAME
+  sourceNamespace: openshift-marketplace
+" | oc apply -f -
+    
+    # STEP: 29
+    log "Verifying subscription"
+    oc get subscription -n $OPNS $SUBSCRIPTION_NAME
+    log "Verifying CSV"
+    CSV_NAME=${OPNAME}.v${VERSION}
+    poll "oc get csv -n $OPNS $CSV_NAME"
+    log "Verifying operator deployment"
+    poll "oc get pods -n $OPNS | grep $OPNAME"
+fi
